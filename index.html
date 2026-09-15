@@ -1,0 +1,310 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="UTF-8" />
+<title>Sophia — Transcrição ao Vivo (protótipo)</title>
+<style>
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    max-width: 720px;
+    margin: 60px auto;
+    padding: 0 20px;
+    color: #1a1a1a;
+    background: #fafafa;
+  }
+  h1 { font-size: 22px; margin-bottom: 4px; }
+  p.sub { color: #666; margin-top: 0; }
+  #status {
+    display: inline-block;
+    padding: 4px 10px;
+    border-radius: 999px;
+    font-size: 13px;
+    background: #eee;
+    margin-bottom: 20px;
+  }
+  #status.recording { background: #ffe1e1; color: #b00020; }
+  .mic-level {
+    width: 100%;
+    height: 10px;
+    background: #eee;
+    border-radius: 999px;
+    overflow: hidden;
+    margin: 4px 0 6px 0;
+  }
+  .mic-level-fill {
+    height: 100%;
+    width: 0%;
+    background: #2ecc71;
+    transition: width 80ms linear;
+  }
+  .mic-status {
+    font-size: 13px;
+    color: #999;
+    margin-bottom: 16px;
+  }
+  .mic-status.active { color: #1f9d55; font-weight: 600; }
+  button {
+    padding: 10px 20px;
+    font-size: 15px;
+    border-radius: 8px;
+    border: none;
+    cursor: pointer;
+    margin-right: 10px;
+  }
+  #startBtn { background: #1a1a1a; color: white; }
+  #stopBtn { background: #eee; color: #1a1a1a; }
+  button:disabled { opacity: 0.4; cursor: default; }
+  #transcript {
+    margin-top: 24px;
+    padding: 20px;
+    background: white;
+    border: 1px solid #e0e0e0;
+    border-radius: 10px;
+    min-height: 200px;
+    line-height: 1.6;
+    white-space: pre-wrap;
+  }
+  .interim { color: #999; }
+</style>
+</head>
+<body>
+
+<h1>Sophia — Protótipo de Transcrição</h1>
+<p class="sub">Gravação e transcrição ao vivo da conversa com o cliente.</p>
+
+<span id="status">parado</span><br><br>
+
+<div class="mic-level"><div id="micLevelFill" class="mic-level-fill"></div></div>
+<div id="micStatus" class="mic-status">🎤 microfone parado</div>
+
+<button id="startBtn">Iniciar gravação</button>
+<button id="stopBtn" disabled>Parar gravação</button>
+
+<div id="transcript"></div>
+
+<script>
+const WS_URL = "ws://localhost:8000/ws/transcribe";
+
+const startBtn = document.getElementById("startBtn");
+const stopBtn = document.getElementById("stopBtn");
+const statusEl = document.getElementById("status");
+const transcriptEl = document.getElementById("transcript");
+const micLevelFill = document.getElementById("micLevelFill");
+const micStatusEl = document.getElementById("micStatus");
+
+// Duração de cada bloco de áudio enviado ao backend (ms).
+// O Whisper transcreve bloco a bloco (não é streaming palavra-por-palavra).
+const SEGMENT_MS = 4000;
+
+// Quantos ms do FINAL de cada bloco são repetidos no INÍCIO do próximo,
+// como contexto para o Whisper não "cortar" palavras/frases na fronteira
+// entre blocos. O backend descarta essa parte repetida ao montar o texto.
+const OVERLAP_MS = 1000;
+
+let socket;
+let mediaStream;
+let currentRecorder;
+let isRecording = false;
+let finalText = "";
+let previousTail = null; // Float32Array com o "resto" do bloco anterior
+
+// --- Medidor de nível do microfone (Web Audio API) ---
+let audioContext, analyser, micDataArray, meterFrameId;
+
+function setupMicMeter(stream) {
+  audioContext = new (window.AudioContext || window.webkitAudioContext)();
+  const source = audioContext.createMediaStreamSource(stream);
+  analyser = audioContext.createAnalyser();
+  analyser.fftSize = 512;
+  analyser.smoothingTimeConstant = 0.6;
+  source.connect(analyser);
+  micDataArray = new Uint8Array(analyser.frequencyBinCount);
+  updateMicMeter();
+}
+
+function updateMicMeter() {
+  analyser.getByteFrequencyData(micDataArray);
+  const avg = micDataArray.reduce((a, b) => a + b, 0) / micDataArray.length;
+  const level = Math.min(100, Math.round((avg / 100) * 100));
+
+  micLevelFill.style.width = level + "%";
+
+  if (level > 6) {
+    micStatusEl.textContent = "🎤 captando áudio...";
+    micStatusEl.classList.add("active");
+  } else {
+    micStatusEl.textContent = "🎤 microfone ligado (silêncio)";
+    micStatusEl.classList.remove("active");
+  }
+
+  meterFrameId = requestAnimationFrame(updateMicMeter);
+}
+
+function stopMicMeter() {
+  if (meterFrameId) cancelAnimationFrame(meterFrameId);
+  if (audioContext) audioContext.close();
+  micLevelFill.style.width = "0%";
+  micStatusEl.textContent = "🎤 microfone parado";
+  micStatusEl.classList.remove("active");
+}
+
+// --- Utilitários de áudio: decodificar blob e montar WAV com overlap ---
+
+function getSilentTail(sampleRate) {
+  const length = Math.round((OVERLAP_MS / 1000) * sampleRate);
+  return new Float32Array(length); // silêncio (zeros)
+}
+
+async function decodeBlobToPCM(blob) {
+  const arrayBuffer = await blob.arrayBuffer();
+  const audioBuffer = await audioContext.decodeAudioData(arrayBuffer);
+  return audioBuffer.getChannelData(0).slice(); // cópia, mono
+}
+
+// Codifica um Float32Array em um WAV PCM 16-bit mono (formato simples e
+// universalmente decodificável, evita depender de headers do WebM).
+function encodeWavFloat32(samples, sampleRate) {
+  const bytesPerSample = 2;
+  const blockAlign = bytesPerSample; // mono
+  const byteRate = sampleRate * blockAlign;
+  const dataSize = samples.length * bytesPerSample;
+  const buffer = new ArrayBuffer(44 + dataSize);
+  const view = new DataView(buffer);
+
+  const writeString = (offset, str) => {
+    for (let i = 0; i < str.length; i++) view.setUint8(offset + i, str.charCodeAt(i));
+  };
+
+  writeString(0, "RIFF");
+  view.setUint32(4, 36 + dataSize, true);
+  writeString(8, "WAVE");
+  writeString(12, "fmt ");
+  view.setUint32(16, 16, true);
+  view.setUint16(20, 1, true); // PCM
+  view.setUint16(22, 1, true); // mono
+  view.setUint32(24, sampleRate, true);
+  view.setUint32(28, byteRate, true);
+  view.setUint16(32, blockAlign, true);
+  view.setUint16(34, 16, true); // bits por amostra
+  writeString(36, "data");
+  view.setUint32(40, dataSize, true);
+
+  let offset = 44;
+  for (let i = 0; i < samples.length; i++, offset += 2) {
+    const s = Math.max(-1, Math.min(1, samples[i]));
+    view.setInt16(offset, s < 0 ? s * 0x8000 : s * 0x7fff, true);
+  }
+
+  return buffer;
+}
+
+function startSegment() {
+  const chunks = [];
+  currentRecorder = new MediaRecorder(mediaStream, { mimeType: "audio/webm;codecs=opus" });
+
+  currentRecorder.ondataavailable = (event) => {
+    if (event.data.size > 0) chunks.push(event.data);
+  };
+
+  currentRecorder.onstop = async () => {
+    const blob = new Blob(chunks, { type: "audio/webm;codecs=opus" });
+
+    if (blob.size > 0 && socket && socket.readyState === WebSocket.OPEN) {
+      try {
+        const currentPCM = await decodeBlobToPCM(blob);
+
+        if (!previousTail) {
+          previousTail = getSilentTail(audioContext.sampleRate);
+        }
+
+        // Monta: [cauda do bloco anterior] + [áudio novo deste bloco]
+        const combined = new Float32Array(previousTail.length + currentPCM.length);
+        combined.set(previousTail, 0);
+        combined.set(currentPCM, previousTail.length);
+
+        const wavBuffer = encodeWavFloat32(combined, audioContext.sampleRate);
+        socket.send(wavBuffer);
+
+        // Guarda o último OVERLAP_MS deste bloco para colar no próximo
+        const tailLength = Math.round((OVERLAP_MS / 1000) * audioContext.sampleRate);
+        previousTail = currentPCM.slice(Math.max(0, currentPCM.length - tailLength));
+      } catch (err) {
+        console.error("Erro ao processar áudio do bloco:", err);
+      }
+    }
+
+    if (isRecording) startSegment(); // encadeia o próximo bloco
+  };
+
+  currentRecorder.start();
+
+  // Fecha este bloco (arquivo webm completo e independente) após SEGMENT_MS
+  setTimeout(() => {
+    if (currentRecorder.state !== "inactive") currentRecorder.stop();
+  }, SEGMENT_MS);
+}
+
+startBtn.onclick = async () => {
+  try {
+    mediaStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    setupMicMeter(mediaStream);
+    previousTail = null; // reinicia o overlap a cada nova sessão de gravação
+
+    socket = new WebSocket(WS_URL);
+    socket.binaryType = "arraybuffer";
+
+    socket.onopen = () => {
+      isRecording = true;
+      startSegment();
+
+      statusEl.textContent = "gravando... (transcrição a cada ~4s)";
+      statusEl.classList.add("recording");
+      startBtn.disabled = true;
+      stopBtn.disabled = false;
+    };
+
+    socket.onmessage = (event) => {
+      const data = JSON.parse(event.data);
+
+      if (data.type === "error") {
+        console.error("Erro do backend:", data.message);
+        transcriptEl.innerHTML += `<div style="color:red">[erro] ${data.message}</div>`;
+        return;
+      }
+
+      if (data.type === "transcript") {
+        finalText += data.text + " ";
+        transcriptEl.textContent = finalText;
+      }
+    };
+
+    socket.onerror = (err) => console.error("Erro no WebSocket:", err);
+
+  } catch (err) {
+    alert("Não foi possível acessar o microfone: " + err.message);
+  }
+};
+
+stopBtn.onclick = () => {
+  isRecording = false;
+  stopMicMeter();
+
+  if (currentRecorder && currentRecorder.state !== "inactive") {
+    currentRecorder.stop();
+  }
+  if (mediaStream) {
+    mediaStream.getTracks().forEach((track) => track.stop());
+  }
+  if (socket && socket.readyState === WebSocket.OPEN) {
+    socket.close();
+  }
+
+  statusEl.textContent = "parado";
+  statusEl.classList.remove("recording");
+  startBtn.disabled = false;
+  stopBtn.disabled = true;
+};
+</script>
+
+</body>
+</html>
