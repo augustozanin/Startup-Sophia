@@ -72,6 +72,13 @@
 <h1>Sophia — Protótipo de Transcrição</h1>
 <p class="sub">Gravação e transcrição ao vivo da conversa com o cliente.</p>
 
+<div style="margin-bottom: 16px;">
+  <label for="micSelect" style="font-size: 13px; color: #666; display: block; margin-bottom: 4px;">
+    Microfone:
+  </label>
+  <select id="micSelect" style="padding: 8px; border-radius: 6px; border: 1px solid #ccc; min-width: 260px;"></select>
+</div>
+
 <span id="status">parado</span><br><br>
 
 <div class="mic-level"><div id="micLevelFill" class="mic-level-fill"></div></div>
@@ -91,6 +98,67 @@ const statusEl = document.getElementById("status");
 const transcriptEl = document.getElementById("transcript");
 const micLevelFill = document.getElementById("micLevelFill");
 const micStatusEl = document.getElementById("micStatus");
+const micSelect = document.getElementById("micSelect");
+
+// --- Seletor de microfone ---
+
+async function popularListaMicrofones() {
+  try {
+    const devices = await navigator.mediaDevices.enumerateDevices();
+    const mics = devices.filter((d) => d.kind === "audioinput");
+    const selecionadoAntes = micSelect.value;
+
+    micSelect.innerHTML = "";
+
+    if (mics.length === 0) {
+      const option = document.createElement("option");
+      option.textContent = "Nenhum microfone encontrado";
+      micSelect.appendChild(option);
+      return;
+    }
+
+    mics.forEach((mic, i) => {
+      const option = document.createElement("option");
+      option.value = mic.deviceId;
+      option.textContent = mic.label || `Microfone ${i + 1}`;
+      micSelect.appendChild(option);
+    });
+
+    // Mantém a escolha do usuário se o dispositivo ainda existir na lista
+    if (mics.some((m) => m.deviceId === selecionadoAntes)) {
+      micSelect.value = selecionadoAntes;
+    }
+  } catch (err) {
+    console.error("Erro ao listar microfones:", err);
+  }
+}
+
+// O navegador só mostra o nome real dos microfones (label) depois que
+// alguma permissão de áudio já foi concedida. Por isso pedimos acesso
+// uma vez, listamos os dispositivos, e liberamos esse stream temporário
+// (a gravação de verdade abre um stream novo, com o mic escolhido).
+async function pedirPermissaoEListarMics() {
+  try {
+    const tempStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    tempStream.getTracks().forEach((t) => t.stop());
+  } catch (err) {
+    console.warn("Permissão de microfone ainda não concedida:", err);
+  }
+  await popularListaMicrofones();
+}
+
+// Atualiza a lista automaticamente se um mic for conectado/desconectado
+// (ex: plugar a lapela depois da página já aberta)
+if (navigator.mediaDevices && navigator.mediaDevices.addEventListener) {
+  navigator.mediaDevices.addEventListener("devicechange", popularListaMicrofones);
+  pedirPermissaoEListarMics();
+} else {
+  micSelect.innerHTML = '<option>Acesse via http://localhost (não IP) para listar microfones</option>';
+  console.warn(
+    "navigator.mediaDevices indisponível — a página precisa ser aberta via " +
+    "https:// ou http://localhost (não pelo IP da rede, nem por file://)."
+  );
+}
 
 // Duração de cada bloco de áudio enviado ao backend (ms).
 // O Whisper transcreve bloco a bloco (não é streaming palavra-por-palavra).
@@ -100,6 +168,12 @@ const SEGMENT_MS = 4000;
 // como contexto para o Whisper não "cortar" palavras/frases na fronteira
 // entre blocos. O backend descarta essa parte repetida ao montar o texto.
 const OVERLAP_MS = 1000;
+
+// Amplificação aplicada ao áudio antes de enviar. Comece em 1.0 (sem
+// alteração) e só aumente aos poucos (ex: 1.3, 1.6) se o volume estiver
+// realmente baixo. Valores altos (3+) tendem a distorcer o áudio e pioram
+// a transcrição em vez de ajudar.
+const AUDIO_GAIN = 1.0;
 
 let socket;
 let mediaStream;
@@ -115,21 +189,26 @@ function setupMicMeter(stream) {
   audioContext = new (window.AudioContext || window.webkitAudioContext)();
   const source = audioContext.createMediaStreamSource(stream);
   analyser = audioContext.createAnalyser();
-  analyser.fftSize = 512;
-  analyser.smoothingTimeConstant = 0.6;
+  analyser.fftSize = 2048;
   source.connect(analyser);
-  micDataArray = new Uint8Array(analyser.frequencyBinCount);
+  micDataArray = new Uint8Array(analyser.fftSize);
   updateMicMeter();
 }
 
 function updateMicMeter() {
-  analyser.getByteFrequencyData(micDataArray);
-  const avg = micDataArray.reduce((a, b) => a + b, 0) / micDataArray.length;
-  const level = Math.min(100, Math.round((avg / 100) * 100));
+  // Mesmo método (pico no domínio do tempo) usado em teste-microfone.html,
+  // pra ser diretamente comparável com aquele resultado.
+  analyser.getByteTimeDomainData(micDataArray);
+  let peak = 0;
+  for (let i = 0; i < micDataArray.length; i++) {
+    const value = Math.abs(micDataArray[i] - 128) / 128;
+    if (value > peak) peak = value;
+  }
+  const level = Math.min(100, Math.round(peak * 100));
 
   micLevelFill.style.width = level + "%";
 
-  if (level > 6) {
+  if (level > 8) {
     micStatusEl.textContent = "🎤 captando áudio...";
     micStatusEl.classList.add("active");
   } else {
@@ -158,7 +237,16 @@ function getSilentTail(sampleRate) {
 async function decodeBlobToPCM(blob) {
   const arrayBuffer = await blob.arrayBuffer();
   const audioBuffer = await audioContext.decodeAudioData(arrayBuffer);
-  return audioBuffer.getChannelData(0).slice(); // cópia, mono
+  const samples = audioBuffer.getChannelData(0).slice(); // cópia, mono
+
+  // Aplica amplificação (com clamp para evitar distorção/estouro)
+  if (AUDIO_GAIN !== 1.0) {
+    for (let i = 0; i < samples.length; i++) {
+      samples[i] = Math.max(-1, Math.min(1, samples[i] * AUDIO_GAIN));
+    }
+  }
+
+  return samples;
 }
 
 // Codifica um Float32Array em um WAV PCM 16-bit mono (formato simples e
@@ -229,7 +317,18 @@ function startSegment() {
         const tailLength = Math.round((OVERLAP_MS / 1000) * audioContext.sampleRate);
         previousTail = currentPCM.slice(Math.max(0, currentPCM.length - tailLength));
       } catch (err) {
-        console.error("Erro ao processar áudio do bloco:", err);
+        // Plano B: se não conseguimos decodificar/montar o overlap (bug
+        // conhecido e intermitente do WebM no navegador), mandamos o
+        // áudio original (sem overlap) em vez de simplesmente perder o
+        // bloco inteiro. Perde só o benefício do overlap nesse trecho.
+        console.warn("Falha ao aplicar overlap neste bloco, enviando sem overlap:", err);
+        try {
+          const rawBuffer = await blob.arrayBuffer();
+          socket.send(rawBuffer);
+        } catch (fallbackErr) {
+          console.error("Falha também no envio de fallback do bloco:", fallbackErr);
+        }
+        previousTail = null; // próximo bloco recomeça com cauda de silêncio
       }
     }
 
@@ -245,8 +344,32 @@ function startSegment() {
 }
 
 startBtn.onclick = async () => {
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+    alert(
+      "O navegador não permite acesso ao microfone neste endereço.\n\n" +
+      "Abra a página via http://localhost:5500 (não pelo IP da rede, " +
+      "nem abrindo o arquivo direto)."
+    );
+    return;
+  }
+
   try {
-    mediaStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    const dispositivoSelecionado = micSelect.value;
+
+    mediaStream = await navigator.mediaDevices.getUserMedia({
+      audio: {
+        deviceId: dispositivoSelecionado ? { exact: dispositivoSelecionado } : undefined,
+        // No Linux, o Chrome às vezes ajusta o volume real do microfone
+        // no sistema operacional durante a gravação quando isso está
+        // ligado — deixando alguns blocos mais altos que outros e
+        // prejudicando a transcrição de forma inconsistente. Desligado
+        // aqui de propósito: ajuste o volume do mic direto no sistema
+        // operacional (fixo), uma vez, antes de gravar.
+        autoGainControl: false,
+        echoCancellation: false,
+        noiseSuppression: false,
+      },
+    });
     setupMicMeter(mediaStream);
     previousTail = null; // reinicia o overlap a cada nova sessão de gravação
 
@@ -264,7 +387,15 @@ startBtn.onclick = async () => {
     };
 
     socket.onmessage = (event) => {
-      const data = JSON.parse(event.data);
+      console.log("[ws] mensagem recebida:", event.data);
+
+      let data;
+      try {
+        data = JSON.parse(event.data);
+      } catch (err) {
+        console.error("[ws] falha ao interpretar mensagem:", err, event.data);
+        return;
+      }
 
       if (data.type === "error") {
         console.error("Erro do backend:", data.message);
@@ -273,6 +404,7 @@ startBtn.onclick = async () => {
       }
 
       if (data.type === "transcript") {
+        console.log("[ws] texto recebido:", data.text);
         finalText += data.text + " ";
         transcriptEl.textContent = finalText;
       }
