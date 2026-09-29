@@ -2,3 +2,7 @@ fastapi
 uvicorn[standard]
 faster-whisper
 websockets
+python-multipart
+httpx
+python-dotenv
+motor

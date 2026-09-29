@@ -2,3 +2,7 @@ venv
 .env.example
 .idea
 __pycache__/
+requirements.txt
+debug_audio
+transcricoes
+.env

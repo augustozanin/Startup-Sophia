@@ -2,7 +2,7 @@
 <html lang="pt-BR">
 <head>
 <meta charset="UTF-8" />
-<title>Sophia — Transcrição ao Vivo (protótipo)</title>
+<title>Sophia — Transcrição (gravação completa)</title>
 <style>
   body {
     font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
@@ -20,9 +20,10 @@
     border-radius: 999px;
     font-size: 13px;
     background: #eee;
-    margin-bottom: 20px;
+    margin-bottom: 16px;
   }
   #status.recording { background: #ffe1e1; color: #b00020; }
+  #status.processing { background: #fff4d6; color: #9a6a00; }
   .mic-level {
     width: 100%;
     height: 10px;
@@ -60,23 +61,28 @@
     background: white;
     border: 1px solid #e0e0e0;
     border-radius: 10px;
-    min-height: 200px;
+    min-height: 150px;
     line-height: 1.6;
     white-space: pre-wrap;
   }
-  .interim { color: #999; }
+  select {
+    padding: 8px;
+    border-radius: 6px;
+    border: 1px solid #ccc;
+    min-width: 260px;
+  }
 </style>
 </head>
 <body>
 
-<h1>Sophia — Protótipo de Transcrição</h1>
-<p class="sub">Gravação e transcrição ao vivo da conversa com o cliente.</p>
+<h1>Sophia — Transcrição</h1>
+<p class="sub">Grava a conversa inteira e transcreve tudo de uma vez no final (sem tempo real por enquanto).</p>
 
 <div style="margin-bottom: 16px;">
   <label for="micSelect" style="font-size: 13px; color: #666; display: block; margin-bottom: 4px;">
     Microfone:
   </label>
-  <select id="micSelect" style="padding: 8px; border-radius: 6px; border: 1px solid #ccc; min-width: 260px;"></select>
+  <select id="micSelect"></select>
 </div>
 
 <span id="status">parado</span><br><br>
@@ -85,12 +91,27 @@
 <div id="micStatus" class="mic-status">🎤 microfone parado</div>
 
 <button id="startBtn">Iniciar gravação</button>
-<button id="stopBtn" disabled>Parar gravação</button>
+<button id="stopBtn" disabled>Parar e transcrever</button>
 
-<div id="transcript"></div>
+<div id="transcript">A transcrição vai aparecer aqui depois que você parar a gravação.</div>
+
+<div id="revisaoArea" style="margin-top: 16px;">
+  <label for="groqKeyInput" style="font-size: 13px; color: #666; display: block; margin-bottom: 4px;">
+    Chave da API Groq (fica só nesta aba, não é salva — deixe vazio para usar a do .env do backend):
+  </label>
+  <input
+    type="password"
+    id="groqKeyInput"
+    placeholder="gsk_..."
+    style="padding: 8px; border-radius: 6px; border: 1px solid #ccc; width: 100%; max-width: 400px; margin-bottom: 10px;"
+  />
+  <div id="revisaoStatus" style="font-size: 13px; color: #999; margin-top: 8px;"></div>
+</div>
 
 <script>
-const WS_URL = "ws://localhost:8000/ws/transcribe";
+const API_URL = "http://localhost:8000/transcribe";
+const REVISAR_URL = "http://localhost:8000/revisar-transcricao";
+const SALVAR_URL = "http://localhost:8000/salvar-transcricao";
 
 const startBtn = document.getElementById("startBtn");
 const stopBtn = document.getElementById("stopBtn");
@@ -99,88 +120,13 @@ const transcriptEl = document.getElementById("transcript");
 const micLevelFill = document.getElementById("micLevelFill");
 const micStatusEl = document.getElementById("micStatus");
 const micSelect = document.getElementById("micSelect");
+const revisaoArea = document.getElementById("revisaoArea");
+const groqKeyInput = document.getElementById("groqKeyInput");
+const revisaoStatus = document.getElementById("revisaoStatus");
 
-// --- Seletor de microfone ---
-
-async function popularListaMicrofones() {
-  try {
-    const devices = await navigator.mediaDevices.enumerateDevices();
-    const mics = devices.filter((d) => d.kind === "audioinput");
-    const selecionadoAntes = micSelect.value;
-
-    micSelect.innerHTML = "";
-
-    if (mics.length === 0) {
-      const option = document.createElement("option");
-      option.textContent = "Nenhum microfone encontrado";
-      micSelect.appendChild(option);
-      return;
-    }
-
-    mics.forEach((mic, i) => {
-      const option = document.createElement("option");
-      option.value = mic.deviceId;
-      option.textContent = mic.label || `Microfone ${i + 1}`;
-      micSelect.appendChild(option);
-    });
-
-    // Mantém a escolha do usuário se o dispositivo ainda existir na lista
-    if (mics.some((m) => m.deviceId === selecionadoAntes)) {
-      micSelect.value = selecionadoAntes;
-    }
-  } catch (err) {
-    console.error("Erro ao listar microfones:", err);
-  }
-}
-
-// O navegador só mostra o nome real dos microfones (label) depois que
-// alguma permissão de áudio já foi concedida. Por isso pedimos acesso
-// uma vez, listamos os dispositivos, e liberamos esse stream temporário
-// (a gravação de verdade abre um stream novo, com o mic escolhido).
-async function pedirPermissaoEListarMics() {
-  try {
-    const tempStream = await navigator.mediaDevices.getUserMedia({ audio: true });
-    tempStream.getTracks().forEach((t) => t.stop());
-  } catch (err) {
-    console.warn("Permissão de microfone ainda não concedida:", err);
-  }
-  await popularListaMicrofones();
-}
-
-// Atualiza a lista automaticamente se um mic for conectado/desconectado
-// (ex: plugar a lapela depois da página já aberta)
-if (navigator.mediaDevices && navigator.mediaDevices.addEventListener) {
-  navigator.mediaDevices.addEventListener("devicechange", popularListaMicrofones);
-  pedirPermissaoEListarMics();
-} else {
-  micSelect.innerHTML = '<option>Acesse via http://localhost (não IP) para listar microfones</option>';
-  console.warn(
-    "navigator.mediaDevices indisponível — a página precisa ser aberta via " +
-    "https:// ou http://localhost (não pelo IP da rede, nem por file://)."
-  );
-}
-
-// Duração de cada bloco de áudio enviado ao backend (ms).
-// O Whisper transcreve bloco a bloco (não é streaming palavra-por-palavra).
-const SEGMENT_MS = 4000;
-
-// Quantos ms do FINAL de cada bloco são repetidos no INÍCIO do próximo,
-// como contexto para o Whisper não "cortar" palavras/frases na fronteira
-// entre blocos. O backend descarta essa parte repetida ao montar o texto.
-const OVERLAP_MS = 1000;
-
-// Amplificação aplicada ao áudio antes de enviar. Comece em 1.0 (sem
-// alteração) e só aumente aos poucos (ex: 1.3, 1.6) se o volume estiver
-// realmente baixo. Valores altos (3+) tendem a distorcer o áudio e pioram
-// a transcrição em vez de ajudar.
-const AUDIO_GAIN = 1.0;
-
-let socket;
 let mediaStream;
-let currentRecorder;
-let isRecording = false;
-let finalText = "";
-let previousTail = null; // Float32Array com o "resto" do bloco anterior
+let mediaRecorder;
+let recordedChunks = [];
 
 // --- Medidor de nível do microfone (Web Audio API) ---
 let audioContext, analyser, micDataArray, meterFrameId;
@@ -196,8 +142,6 @@ function setupMicMeter(stream) {
 }
 
 function updateMicMeter() {
-  // Mesmo método (pico no domínio do tempo) usado em teste-microfone.html,
-  // pra ser diretamente comparável com aquele resultado.
   analyser.getByteTimeDomainData(micDataArray);
   let peak = 0;
   for (let i = 0; i < micDataArray.length; i++) {
@@ -227,128 +171,65 @@ function stopMicMeter() {
   micStatusEl.classList.remove("active");
 }
 
-// --- Utilitários de áudio: decodificar blob e montar WAV com overlap ---
+// --- Seletor de microfone ---
 
-function getSilentTail(sampleRate) {
-  const length = Math.round((OVERLAP_MS / 1000) * sampleRate);
-  return new Float32Array(length); // silêncio (zeros)
-}
+async function popularListaMicrofones() {
+  try {
+    const devices = await navigator.mediaDevices.enumerateDevices();
+    const mics = devices.filter((d) => d.kind === "audioinput");
+    const selecionadoAntes = micSelect.value;
 
-async function decodeBlobToPCM(blob) {
-  const arrayBuffer = await blob.arrayBuffer();
-  const audioBuffer = await audioContext.decodeAudioData(arrayBuffer);
-  const samples = audioBuffer.getChannelData(0).slice(); // cópia, mono
+    micSelect.innerHTML = "";
 
-  // Aplica amplificação (com clamp para evitar distorção/estouro)
-  if (AUDIO_GAIN !== 1.0) {
-    for (let i = 0; i < samples.length; i++) {
-      samples[i] = Math.max(-1, Math.min(1, samples[i] * AUDIO_GAIN));
-    }
-  }
-
-  return samples;
-}
-
-// Codifica um Float32Array em um WAV PCM 16-bit mono (formato simples e
-// universalmente decodificável, evita depender de headers do WebM).
-function encodeWavFloat32(samples, sampleRate) {
-  const bytesPerSample = 2;
-  const blockAlign = bytesPerSample; // mono
-  const byteRate = sampleRate * blockAlign;
-  const dataSize = samples.length * bytesPerSample;
-  const buffer = new ArrayBuffer(44 + dataSize);
-  const view = new DataView(buffer);
-
-  const writeString = (offset, str) => {
-    for (let i = 0; i < str.length; i++) view.setUint8(offset + i, str.charCodeAt(i));
-  };
-
-  writeString(0, "RIFF");
-  view.setUint32(4, 36 + dataSize, true);
-  writeString(8, "WAVE");
-  writeString(12, "fmt ");
-  view.setUint32(16, 16, true);
-  view.setUint16(20, 1, true); // PCM
-  view.setUint16(22, 1, true); // mono
-  view.setUint32(24, sampleRate, true);
-  view.setUint32(28, byteRate, true);
-  view.setUint16(32, blockAlign, true);
-  view.setUint16(34, 16, true); // bits por amostra
-  writeString(36, "data");
-  view.setUint32(40, dataSize, true);
-
-  let offset = 44;
-  for (let i = 0; i < samples.length; i++, offset += 2) {
-    const s = Math.max(-1, Math.min(1, samples[i]));
-    view.setInt16(offset, s < 0 ? s * 0x8000 : s * 0x7fff, true);
-  }
-
-  return buffer;
-}
-
-function startSegment() {
-  const chunks = [];
-  currentRecorder = new MediaRecorder(mediaStream, { mimeType: "audio/webm;codecs=opus" });
-
-  currentRecorder.ondataavailable = (event) => {
-    if (event.data.size > 0) chunks.push(event.data);
-  };
-
-  currentRecorder.onstop = async () => {
-    const blob = new Blob(chunks, { type: "audio/webm;codecs=opus" });
-
-    if (blob.size > 0 && socket && socket.readyState === WebSocket.OPEN) {
-      try {
-        const currentPCM = await decodeBlobToPCM(blob);
-
-        if (!previousTail) {
-          previousTail = getSilentTail(audioContext.sampleRate);
-        }
-
-        // Monta: [cauda do bloco anterior] + [áudio novo deste bloco]
-        const combined = new Float32Array(previousTail.length + currentPCM.length);
-        combined.set(previousTail, 0);
-        combined.set(currentPCM, previousTail.length);
-
-        const wavBuffer = encodeWavFloat32(combined, audioContext.sampleRate);
-        socket.send(wavBuffer);
-
-        // Guarda o último OVERLAP_MS deste bloco para colar no próximo
-        const tailLength = Math.round((OVERLAP_MS / 1000) * audioContext.sampleRate);
-        previousTail = currentPCM.slice(Math.max(0, currentPCM.length - tailLength));
-      } catch (err) {
-        // Plano B: se não conseguimos decodificar/montar o overlap (bug
-        // conhecido e intermitente do WebM no navegador), mandamos o
-        // áudio original (sem overlap) em vez de simplesmente perder o
-        // bloco inteiro. Perde só o benefício do overlap nesse trecho.
-        console.warn("Falha ao aplicar overlap neste bloco, enviando sem overlap:", err);
-        try {
-          const rawBuffer = await blob.arrayBuffer();
-          socket.send(rawBuffer);
-        } catch (fallbackErr) {
-          console.error("Falha também no envio de fallback do bloco:", fallbackErr);
-        }
-        previousTail = null; // próximo bloco recomeça com cauda de silêncio
-      }
+    if (mics.length === 0) {
+      const option = document.createElement("option");
+      option.textContent = "Nenhum microfone encontrado";
+      micSelect.appendChild(option);
+      return;
     }
 
-    if (isRecording) startSegment(); // encadeia o próximo bloco
-  };
+    mics.forEach((mic, i) => {
+      const option = document.createElement("option");
+      option.value = mic.deviceId;
+      option.textContent = mic.label || `Microfone ${i + 1}`;
+      micSelect.appendChild(option);
+    });
 
-  currentRecorder.start();
-
-  // Fecha este bloco (arquivo webm completo e independente) após SEGMENT_MS
-  setTimeout(() => {
-    if (currentRecorder.state !== "inactive") currentRecorder.stop();
-  }, SEGMENT_MS);
+    if (mics.some((m) => m.deviceId === selecionadoAntes)) {
+      micSelect.value = selecionadoAntes;
+    }
+  } catch (err) {
+    console.error("Erro ao listar microfones:", err);
+  }
 }
+
+async function pedirPermissaoEListarMics() {
+  try {
+    const tempStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    tempStream.getTracks().forEach((t) => t.stop());
+  } catch (err) {
+    console.warn("Permissão de microfone ainda não concedida:", err);
+  }
+  await popularListaMicrofones();
+}
+
+if (navigator.mediaDevices && navigator.mediaDevices.addEventListener) {
+  navigator.mediaDevices.addEventListener("devicechange", popularListaMicrofones);
+  pedirPermissaoEListarMics();
+} else {
+  micSelect.innerHTML = '<option>Acesse via http://localhost (não IP) para listar microfones</option>';
+  console.warn(
+    "navigator.mediaDevices indisponível — abra via https:// ou http://localhost."
+  );
+}
+
+// --- Gravação (arquivo único, do início ao fim) ---
 
 startBtn.onclick = async () => {
   if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
     alert(
       "O navegador não permite acesso ao microfone neste endereço.\n\n" +
-      "Abra a página via http://localhost:5500 (não pelo IP da rede, " +
-      "nem abrindo o arquivo direto)."
+      "Abra a página via http://localhost:5500 (não pelo IP da rede)."
     );
     return;
   }
@@ -359,58 +240,28 @@ startBtn.onclick = async () => {
     mediaStream = await navigator.mediaDevices.getUserMedia({
       audio: {
         deviceId: dispositivoSelecionado ? { exact: dispositivoSelecionado } : undefined,
-        // No Linux, o Chrome às vezes ajusta o volume real do microfone
-        // no sistema operacional durante a gravação quando isso está
-        // ligado — deixando alguns blocos mais altos que outros e
-        // prejudicando a transcrição de forma inconsistente. Desligado
-        // aqui de propósito: ajuste o volume do mic direto no sistema
-        // operacional (fixo), uma vez, antes de gravar.
         autoGainControl: false,
         echoCancellation: false,
         noiseSuppression: false,
       },
     });
+
     setupMicMeter(mediaStream);
-    previousTail = null; // reinicia o overlap a cada nova sessão de gravação
 
-    socket = new WebSocket(WS_URL);
-    socket.binaryType = "arraybuffer";
+    recordedChunks = [];
+    mediaRecorder = new MediaRecorder(mediaStream, { mimeType: "audio/webm;codecs=opus" });
 
-    socket.onopen = () => {
-      isRecording = true;
-      startSegment();
-
-      statusEl.textContent = "gravando... (transcrição a cada ~4s)";
-      statusEl.classList.add("recording");
-      startBtn.disabled = true;
-      stopBtn.disabled = false;
+    mediaRecorder.ondataavailable = (event) => {
+      if (event.data.size > 0) recordedChunks.push(event.data);
     };
 
-    socket.onmessage = (event) => {
-      console.log("[ws] mensagem recebida:", event.data);
+    mediaRecorder.start();
 
-      let data;
-      try {
-        data = JSON.parse(event.data);
-      } catch (err) {
-        console.error("[ws] falha ao interpretar mensagem:", err, event.data);
-        return;
-      }
-
-      if (data.type === "error") {
-        console.error("Erro do backend:", data.message);
-        transcriptEl.innerHTML += `<div style="color:red">[erro] ${data.message}</div>`;
-        return;
-      }
-
-      if (data.type === "transcript") {
-        console.log("[ws] texto recebido:", data.text);
-        finalText += data.text + " ";
-        transcriptEl.textContent = finalText;
-      }
-    };
-
-    socket.onerror = (err) => console.error("Erro no WebSocket:", err);
+    statusEl.textContent = "gravando... (fale à vontade, sem pressa)";
+    statusEl.className = "recording";
+    transcriptEl.textContent = "";
+    startBtn.disabled = true;
+    stopBtn.disabled = false;
 
   } catch (err) {
     alert("Não foi possível acessar o microfone: " + err.message);
@@ -418,24 +269,108 @@ startBtn.onclick = async () => {
 };
 
 stopBtn.onclick = () => {
-  isRecording = false;
   stopMicMeter();
-
-  if (currentRecorder && currentRecorder.state !== "inactive") {
-    currentRecorder.stop();
-  }
-  if (mediaStream) {
-    mediaStream.getTracks().forEach((track) => track.stop());
-  }
-  if (socket && socket.readyState === WebSocket.OPEN) {
-    socket.close();
-  }
-
-  statusEl.textContent = "parado";
-  statusEl.classList.remove("recording");
-  startBtn.disabled = false;
   stopBtn.disabled = true;
+
+  mediaRecorder.onstop = async () => {
+    mediaStream.getTracks().forEach((t) => t.stop());
+
+    statusEl.textContent = "transcrevendo... (pode levar um tempo, aguarde)";
+    statusEl.className = "processing";
+    transcriptEl.textContent = "";
+
+    const blob = new Blob(recordedChunks, { type: "audio/webm;codecs=opus" });
+    const formData = new FormData();
+    formData.append("audio", blob, "gravacao.webm");
+
+    try {
+      const resposta = await fetch(API_URL, { method: "POST", body: formData });
+
+      if (!resposta.ok) {
+        throw new Error(`Servidor respondeu com status ${resposta.status}`);
+      }
+
+      const dados = await resposta.json();
+      const textoTranscrito = dados.text || "";
+      transcriptEl.textContent = textoTranscrito || "(nenhuma fala reconhecida no áudio)";
+
+      let textoFinal = textoTranscrito;
+
+      if (textoTranscrito) {
+        textoFinal = await revisarAutomaticamente(textoTranscrito);
+        await salvarTranscricao(textoFinal);
+      }
+
+    } catch (err) {
+      transcriptEl.innerHTML = `<div style="color:red">Erro ao transcrever: ${err.message}</div>`;
+      console.error(err);
+    } finally {
+      statusEl.textContent = "parado";
+      statusEl.className = "";
+      startBtn.disabled = false;
+    }
+  };
+
+  mediaRecorder.stop();
 };
+
+// Chama a revisão da IA automaticamente e devolve o texto final
+// (revisado, ou o original se a revisão falhar por algum motivo).
+async function revisarAutomaticamente(texto) {
+  const chave = groqKeyInput.value.trim(); // pode ficar vazio (usa .env do backend)
+
+  revisaoStatus.textContent = "Revisando automaticamente com IA...";
+
+  try {
+    const resposta = await fetch(REVISAR_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ texto, groq_api_key: chave }),
+    });
+
+    const dados = await resposta.json();
+
+    if (dados.erro) {
+      throw new Error(dados.erro);
+    }
+
+    transcriptEl.textContent = dados.texto_revisado;
+    revisaoStatus.textContent = "✅ Revisado automaticamente.";
+    return dados.texto_revisado;
+
+  } catch (err) {
+    revisaoStatus.innerHTML = `<span style="color:red">Revisão falhou (mantendo texto original): ${err.message}</span>`;
+    console.error(err);
+    return texto; // segue com o texto bruto se a revisão falhar
+  }
+}
+
+// Salva o texto final (já revisado) em um arquivo .txt no backend.
+async function salvarTranscricao(texto) {
+  try {
+    const resposta = await fetch(SALVAR_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ texto }),
+    });
+
+    const dados = await resposta.json();
+
+    if (dados.erro) {
+      throw new Error(dados.erro);
+    }
+
+    let msg = "";
+    if (dados.mongo_id) msg += ` 💾 Salvo no MongoDB (id: ${dados.mongo_id})`;
+    if (dados.erro_mongo) msg += ` ⚠️ Falhou ao salvar no MongoDB: ${dados.erro_mongo}`;
+    if (dados.aviso) msg += ` ⚠️ ${dados.aviso}`;
+    revisaoStatus.textContent += msg;
+
+  } catch (err) {
+    console.error("Erro ao salvar transcrição:", err);
+    revisaoStatus.innerHTML += `<br><span style="color:red">Erro ao salvar arquivo: ${err.message}</span>`;
+  }
+}
 </script>
 
 </body>
