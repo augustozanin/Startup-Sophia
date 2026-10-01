@@ -361,7 +361,7 @@ async function salvarTranscricao(texto) {
     }
 
     let msg = "";
-    if (dados.mongo_id) msg += ` 💾 Salvo no MongoDB (id: ${dados.mongo_id})`;
+    if (dados.case_id) msg += ` 💾 Caso salvo no MongoDB (id: ${dados.case_id})`;
     if (dados.erro_mongo) msg += ` ⚠️ Falhou ao salvar no MongoDB: ${dados.erro_mongo}`;
     if (dados.aviso) msg += ` ⚠️ ${dados.aviso}`;
     revisaoStatus.textContent += msg;

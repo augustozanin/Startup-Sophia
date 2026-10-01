@@ -17,7 +17,9 @@ import asyncio
 import io
 import os
 import time
+import uuid
 
+import bcrypt
 import httpx
 from dotenv import load_dotenv
 from fastapi import FastAPI, File, UploadFile, WebSocket, WebSocketDisconnect
@@ -42,7 +44,43 @@ app.add_middleware(
 MONGODB_URI = os.getenv("MONGODB_URI")
 mongo_client = AsyncIOMotorClient(MONGODB_URI) if MONGODB_URI else None
 mongo_db = mongo_client["sophia-data"] if mongo_client else None
-transcript_collection = mongo_db["transcript"] if mongo_db is not None else None
+users_collection = mongo_db["users"] if mongo_db is not None else None
+case_collection = mongo_db["case"] if mongo_db is not None else None
+
+# --- Usuário de teste (substitui um sistema de login real, por enquanto) ---
+# UUID fixo para que o mesmo usuário "teste" seja sempre referenciado,
+# mesmo reiniciando o backend. Quando o login de verdade existir, cada
+# caso passa a usar o user_id do usuário autenticado em vez deste valor
+# fixo — o resto da modelagem (case.user_id) já fica pronto pra isso.
+USUARIO_TESTE_ID = "a3f1c2e4-4b8a-4b6a-9b1a-000000000001"
+USUARIO_TESTE_EMAIL = "teste@sophia.app"
+USUARIO_TESTE_SENHA = "teste1234"  # apenas para desenvolvimento local
+
+
+async def garantir_usuario_teste():
+    """Cria o usuário de teste no banco, se ainda não existir. Chamado
+    na subida do servidor."""
+    if users_collection is None:
+        return
+
+    existente = await users_collection.find_one({"_id": USUARIO_TESTE_ID})
+    if existente:
+        return
+
+    senha_hash = bcrypt.hashpw(USUARIO_TESTE_SENHA.encode("utf-8"), bcrypt.gensalt())
+
+    await users_collection.insert_one({
+        "_id": USUARIO_TESTE_ID,
+        "email": USUARIO_TESTE_EMAIL,
+        "password_hash": senha_hash.decode("utf-8"),
+        "created_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+    })
+    print(f"[debug] usuário de teste criado: {USUARIO_TESTE_EMAIL} (id={USUARIO_TESTE_ID})")
+
+
+@app.on_event("startup")
+async def on_startup():
+    await garantir_usuario_teste()
 
 # Carregado uma única vez, na subida do servidor.
 # "small" = bom equilíbrio entre precisão e velocidade em CPU.
@@ -116,7 +154,7 @@ def transcrever_bloco(audio_bytes: bytes) -> str:
 @app.get("/health")
 async def health():
     mongo_status = "não configurado"
-    if transcript_collection is not None:
+    if case_collection is not None:
         try:
             await mongo_client.admin.command("ping")
             mongo_status = "conectado"
@@ -251,15 +289,16 @@ async def revisar_transcricao(payload: RevisarTextoRequest):
 
 @app.post("/salvar-transcricao")
 async def salvar_transcricao(payload: dict):
-    """Salva o texto final (já revisado, quando possível) como um
-    documento na collection 'transcript' do MongoDB Atlas (Sophia-Base
-    → sophia-data → transcript). Mantém também uma cópia em .txt local
-    como backup simples enquanto validamos o fluxo."""
+    """Cria um novo CASO na collection 'case', com a transcrição embutida
+    e vinculado ao usuário (hoje sempre o usuário de teste, até existir
+    login de verdade). Documentos relacionados ao caso (anexos) entram
+    depois no mesmo documento, no campo 'documents'."""
     texto = (payload.get("texto") or "").strip()
     if not texto:
         return {"erro": "Texto vazio, nada para salvar."}
 
     agora = time.strftime("%Y-%m-%d_%H-%M-%S")
+    agora_iso = time.strftime("%Y-%m-%dT%H:%M:%S")
 
     # Backup local em .txt (mantido por enquanto, redundante com o Mongo)
     os.makedirs("transcricoes", exist_ok=True)
@@ -269,15 +308,21 @@ async def salvar_transcricao(payload: dict):
 
     resultado = {"arquivo_txt": nome_arquivo_txt}
 
-    if transcript_collection is not None:
+    if case_collection is not None:
         try:
-            documento = {
-                "text": texto,
-                "created_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+            caso = {
+                "user_id": USUARIO_TESTE_ID,  # TODO: trocar pelo usuário autenticado quando houver login
+                "transcript": {
+                    "text": texto,
+                    "created_at": agora_iso,
+                },
+                "documents": [],  # reservado para documentos anexados ao caso
+                "created_at": agora_iso,
+                "updated_at": agora_iso,
             }
-            insercao = await transcript_collection.insert_one(documento)
-            resultado["mongo_id"] = str(insercao.inserted_id)
-            print(f"[debug] transcrição salva no MongoDB — id={insercao.inserted_id}")
+            insercao = await case_collection.insert_one(caso)
+            resultado["case_id"] = str(insercao.inserted_id)
+            print(f"[debug] caso salvo no MongoDB — id={insercao.inserted_id}")
         except Exception as exc:  # noqa: BLE001
             resultado["erro_mongo"] = str(exc)
             print(f"[debug] ERRO ao salvar no MongoDB: {exc}")

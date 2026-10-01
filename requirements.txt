@@ -6,3 +6,4 @@ python-multipart
 httpx
 python-dotenv
 motor
+bcrypt
